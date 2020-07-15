@@ -3311,6 +3311,102 @@ static char * get_request_from_uri(struct _oidc_config * config, const char * re
   ulfius_clean_response(&resp);
   return str_request;
 }
+static int import_verify_x5c(jwk_t *jwk, json_t *x5c)
+{
+  int ret;
+  char pem_buff[8192];
+  const char *pem_header = "-----BEGIN CERTIFICATE-----\n";
+  const char *pem_end = "\n-----END CERTIFICATE-----\n";
+  int cert_num = json_array_size(x5c);
+  /*add the first one into jwk which signes the jwt*/
+  json_t *signing_cert = json_array_get(x5c, 0);
+  /*Append PEM header and body so it can be decoded*/
+  const char *signing_cert_body = json_string_value(signing_cert);
+
+  strcpy(pem_buff, pem_header);
+  strcat(pem_buff, signing_cert_body);
+  strcat(pem_buff, pem_end);
+  y_log_message(Y_LOG_LEVEL_DEBUG, "PEMCoded:%s,Length:%d", pem_buff, strlen(pem_buff));
+  /*Import it into jwk*/
+  ret = r_jwk_import_from_pem_der(jwk, R_X509_TYPE_CERTIFICATE, R_FORMAT_PEM, (unsigned char *)pem_buff, strlen(pem_buff));
+  if (ret != 0)
+  {
+    y_log_message(Y_LOG_LEVEL_ERROR, "import_verify_x5c-Failed to import cert into jwk");
+    return ret;
+  }
+  /*Cascade other cert*/
+  for (int i = 1; i < cert_num; i++)
+  {
+    json_t *single_cert = json_array_get(x5c, i);
+    const char *single_cert_body = json_string_value(single_cert);
+    strcat(pem_buff, pem_header);
+    strcat(pem_buff, single_cert_body);
+    strcat(pem_buff, pem_end);
+  }
+
+  /*Import the whole chain into GNUTLS*/
+  gnutls_x509_crt_t *cert_chain = (gnutls_x509_crt_t *)gnutls_malloc(cert_num * sizeof(gnutls_x509_crt_t));
+  if (cert_chain == NULL)
+  {
+    y_log_message(Y_LOG_LEVEL_ERROR, "import_verify_x5c-Failed malloc cert_chain");
+    return 1;
+  }
+
+  unsigned int cert_max = cert_num;
+  gnutls_datum_t gnudata;
+  gnudata.data = (unsigned char *)pem_buff;
+  gnudata.size = strlen(pem_buff);
+  gnutls_x509_trust_list_t ca_list;
+
+  /*put cert chain into gnu data*/
+  ret = gnutls_x509_crt_list_import(cert_chain, &cert_max, &gnudata, GNUTLS_X509_FMT_PEM, 0);
+  if (ret == cert_num)
+  {
+    y_log_message(Y_LOG_LEVEL_DEBUG, "import_verify_x5c-Successfully import cert into GNU");
+  }
+  else if (ret < 0)
+  {
+    y_log_message(Y_LOG_LEVEL_ERROR, "import_verify_x5c-gnutls_x509_crt_list_import failed");
+  }
+
+  /*put last cert (should be root) into ca list*/
+  ret = gnutls_x509_trust_list_init(&ca_list, 1);
+  if (ret < 0)
+  {
+    y_log_message(Y_LOG_LEVEL_ERROR, "import_verify_x5c-gnutls_x509_trust_list_init failed");
+  }
+  ret = gnutls_x509_trust_list_add_cas(ca_list, &cert_chain[cert_max - 1], 1, GNUTLS_TL_NO_DUPLICATES);
+  if (ret == 1)
+  {
+    y_log_message(Y_LOG_LEVEL_DEBUG, "import_verify_x5c-Successfully import ca into calist");
+  }
+  else if (ret < 0)
+  {
+    y_log_message(Y_LOG_LEVEL_ERROR, "import_verify_x5c-gnutls_x509_trust_list_add_cas failed");
+  }
+
+  /*verify the chain*/
+  unsigned int verify_output = 0;
+  ret = gnutls_x509_trust_list_verify_crt(ca_list, cert_chain, cert_max, 0, &verify_output, NULL);
+  if (ret == 0)
+  {
+    y_log_message(Y_LOG_LEVEL_DEBUG, "import_verify_x5c-Successfully verify the certchain");
+  }
+  else
+  {
+    y_log_message(Y_LOG_LEVEL_ERROR, "import_verify_x5c-gnutls_x509_trust_list_verify_crt failed, result=%d", verify_output);
+  }
+  /*Clean GNUTLS data*/
+  /*1 means all in ca_list*/
+  gnutls_x509_trust_list_deinit(ca_list, 1);
+  /*the last one in cert chain should be cleaned with calist*/
+  for (int i = 0; i < cert_num - 1; i++)
+  {
+    gnutls_x509_crt_deinit(cert_chain[i]);
+  }
+  gnutls_free(cert_chain);
+  return ret;
+}
 
 static json_t * verify_request_signature(struct _oidc_config * config, jwt_t * jwt, const char * client_id, const char * ip_source) {
   json_t * j_client, * j_return;
@@ -3319,9 +3415,44 @@ static json_t * verify_request_signature(struct _oidc_config * config, jwt_t * j
   jwa_alg alg = R_JWA_ALG_UNKNOWN;
   
   j_client = config->glewlwyd_config->glewlwyd_plugin_callback_get_client(config->glewlwyd_config, client_id);
-  if (check_result_value(j_client, G_OK) && json_object_get(json_object_get(j_client, "client"), "enabled") == json_true()) {
-    // Client must have a non empty client_secret, a public key available, a jwks or be non confidential
-    alg = r_jwt_get_sign_alg(jwt);
+  /*Extract Cert  from x5c*/
+  y_log_message(Y_LOG_LEVEL_DEBUG, "Client_id:%s", client_id);
+  char *dumpJson = json_dumps(j_client, 0);
+  y_log_message(Y_LOG_LEVEL_DEBUG, "ClientJson:%s", dumpJson);
+
+  json_t *keys = json_object_get(jwt->jws->jwks_pubkey, "keys");
+  json_t *getArraryfirst = json_array_get(keys, 0);
+  json_t *x5c = json_object_get(getArraryfirst, "x5c");
+  char *dumpPubKey = json_dumps(keys, 0);
+  y_log_message(Y_LOG_LEVEL_DEBUG, "PubKey%s", dumpPubKey);
+  if (x5c != NULL)
+  {
+    /*Import cert into jwk and verify the cert chain*/
+    if (r_jwk_init(&jwk) == RHN_OK && import_verify_x5c(jwk, x5c) == 0)
+    {
+      char *dumpJWK = json_dumps(jwk, 0);
+      y_log_message(Y_LOG_LEVEL_DEBUG, "Cert:%s", dumpJWK);
+      if (r_jwt_verify_signature(jwt, jwk, 0) == RHN_OK)
+      {
+        j_return = json_pack("{sisOsi}", "result", G_OK, "client", json_object_get(j_client, "client"), "client_auth_method", GLEWLWYD_CLIENT_AUTH_METHOD_PRIVATE_KEY_JWT);
+        dumpPubKey = json_dumps(j_return, 0);
+        y_log_message(Y_LOG_LEVEL_DEBUG, "Verify Success: %s", dumpPubKey);
+        return j_return;
+      }
+      else
+      {
+        y_log_message(Y_LOG_LEVEL_DEBUG, "verify_request_signature - jwt has an invalid signature (pubkey)", ip_source);
+        y_log_message(Y_LOG_LEVEL_WARNING, "Security - Authorization invalid for client_id %s at IP Address %s", client_id, ip_source);
+        j_return = json_pack("{si}", "result", G_ERROR_UNAUTHORIZED);
+        return j_return;
+      }
+    }
+  }
+  /*x5c extension part end*/
+     if (check_result_value(j_client, G_OK) && json_object_get(json_object_get(j_client, "client"), "enabled") == json_true())
+     {
+       // Client must have a non empty client_secret, a public key available, a jwks or be non confidential
+       alg = r_jwt_get_sign_alg(jwt);
     if (json_object_get(json_object_get(j_client, "client"), "confidential") == json_true()) {
       if (alg == R_JWA_ALG_HS256 || alg == R_JWA_ALG_HS384 || alg == R_JWA_ALG_HS512) {
         if (json_string_length(json_object_get(json_object_get(j_client, "client"), "client_secret"))) {

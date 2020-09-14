@@ -128,7 +128,11 @@
 #define GLEWLWYD_REFRESH_TOKEN_ONE_USE_NEVER         0
 #define GLEWLWYD_REFRESH_TOKEN_ONE_USE_CLIENT_DRIVEN 1
 #define GLEWLWYD_REFRESH_TOKEN_ONE_USE_ALWAYS        2
-
+#define VWS_SERVERNAME  "identityserver.test.rsa"
+#define VWS_SERVERNAME_FIELD "serverName"
+#define VWS_USERNAME "aorzelski@phoenixcontact.com"
+#define VWS_USERNAME_FIELD "userName"
+#define VWS_ROOTCERT ""
 /**
  * Structure used to store all the plugin parameters and data duringexecution
  */
@@ -1195,7 +1199,9 @@ static char * generate_client_access_token(struct _oidc_config * config, json_t 
   char * token = NULL;
   const char * sign_kid = json_string_value(json_object_get(config->j_params, "client-sign_kid-parameter"));
   json_t * j_cnf;
-  
+  char *dumpJson = json_dumps(j_client, 0);
+  y_log_message(Y_LOG_LEVEL_DEBUG, "Client:%s", dumpJson);
+  //r_jwt_set_claim_str_value(jwt, "Client", dumpJson);
   jwt = r_jwt_copy(config->jwt_sign);
   if (jwt != NULL) {
     rand_string_nonce(jti, OIDC_JTI_LENGTH);
@@ -1219,6 +1225,8 @@ static char * generate_client_access_token(struct _oidc_config * config, json_t 
     r_jwt_set_claim_str_value(jwt, "jti", jti);
     r_jwt_set_claim_str_value(jwt, "type", "client_token");
     r_jwt_set_claim_str_value(jwt, "scope", scope_list);
+    r_jwt_set_claim_str_value(jwt,VWS_SERVERNAME_FIELD,VWS_SERVERNAME);
+    r_jwt_set_claim_str_value(jwt,VWS_USERNAME_FIELD,VWS_USERNAME);
     if (x5t_s256 != NULL) {
       j_cnf = json_pack("{ss}", "x5t#S256", x5t_s256);
       r_jwt_set_claim_json_t_value(jwt, "cnf", j_cnf);
